@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Photoreal Voxel Engine - Babylon.js</title>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script src="https://cdn.babylonjs.com/materialsLibrary/babylonjs.materials.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html,body { width: 100%; height: 100%; overflow: hidden; background: #87b8ec; font-family: Arial,sans-serif; touch-action: none; }
+#renderCanvas { width: 100%; height: 100%; touch-action: none; }
+.hud { position: absolute; top: 15px; left: 15px; color: white; background: rgba(0,0,0,.6); padding: 10px 14px; border-radius: 8px; font-size: 12px; pointer-events: none; z-index: 10; }
+.ctl { position: absolute; left: 15px; bottom: 25px; right: 15px; max-width: 320px; color: white; background: rgba(0,0,0,.6); padding: 10px 14px; border-radius: 8px; font-size: 12px; z-index: 10; }
+.ctl label { display: block; margin-top: 6px; }
+.ctl input { width: 100%; }
+#loading { position: absolute; inset: 0; display: grid; place-items: center; background: #111; color: white; z-index: 20; font-size: 16px; text-align: center; }
+#loading small { display: block; margin-top: 8px; color: #999; }
+</style>
+</head>
+<body>
+<div id="loading"><div>Loading Babylon.js Engine...<small id="loadmsg">(Packing Height Maps into Alpha Channels)</small></div></div>
+<canvas id="renderCanvas"></canvas>
+<div class="hud">FPS: <span id="fps">--</span><br>Babylon.js Native Parallax Occlusion<br>Blocks: Grass / Farmland / Podzol</div>
+<div class="ctl">
+    <label>POM depth: <span id="dv">0.07</span>
+        <input id="depth" type="range" min="0" max="0.16" step="0.005" value="0.07">
+    </label>
+    <label>AO / Cavity: <span id="cv">1.0</span>
+        <input id="cavity" type="range" min="0" max="2.0" step="0.1" value="1.0">
+    </label>
+</div>
+
+<script>
+/* ================= CONFIG ================= */
+const isMobile = window.innerWidth < 800;
+const config = {
+    shadowSize: isMobile ? 1024 : 2048,
+    terrainRadius: 8,
+    blockSize: 1.4,
+    derivedMapSize: 512
+};
+
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+
+let globalMaterials = []; // For UI updates
+
+const createScene = async function () {
+    const scene = new BABYLON.Scene(engine);
+    
+    // Environment & Fog
+    scene.clearColor = BABYLON.Color4.FromHexString("#9cc3e8ff");
+    scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
+    scene.fogDensity = 0.012;
+    scene.fogColor = scene.clearColor;
+
+    // Camera
+    const camera = new BABYLON.ArcRotateCamera("camera", Math.PI / 4, Math.PI / 2.5, 30, BABYLON.Vector3.Zero(), scene);
+    camera.attachControl(canvas, true);
+    camera.wheelPrecision = 20;
+    camera.minZ = 0.1;
+    camera.lowerRadiusLimit = 2.5;
+    camera.upperRadiusLimit = 60;
+    camera.target = new BABYLON.Vector3(0, 2, 0);
+
+    // Lighting
+    const hemiLight = new BABYLON.HemisphericLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
+    hemiLight.diffuse = BABYLON.Color3.FromHexString("#cfe3ff");
+    hemiLight.groundColor = BABYLON.Color3.FromHexString("#4a5a35");
+    hemiLight.intensity = 0.6;
+
+    const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-1, -1.5, 0.5), scene);
+    sun.position = new BABYLON.Vector3(30, 45, -15);
+    sun.intensity = 2.6;
+    sun.diffuse = BABYLON.Color3.FromHexString("#fff1dc");
+
+    // Shadows
+    const shadowGen = new BABYLON.ShadowGenerator(config.shadowSize, sun);
+    shadowGen.usePercentageCloserFiltering = true;
+    shadowGen.filteringQuality = BABYLON.ShadowGenerator.QUALITY_MEDIUM;
+
+    // IBL Environment (Built-in Babylon Environment)
+    const envHelper = scene.createDefaultEnvironment({
+        createSkybox: false,
+        createGround: false,
+        environmentTexture: "https://playground.babylonjs.com/textures/environment.dds"
+    });
+    scene.environmentIntensity = 0.55;
+
+    /* ================= TEXTURE LOADING & PACKING ================= */
+    // Helper: Loads image as DOM element
+    function loadImgData(urls) {
+        return new Promise((resolve) => {
+            const attempt = (i) => {
+                if (i >= urls.length) return resolve(null);
+                const img = new Image();
+                img.crossOrigin = "anonymous";
+                img.onload = () => resolve(img);
+                img.onerror = () => attempt(i + 1);
+                img.src = urls[i];
+            };
+            attempt(0);
+        });
+    }
+
+    // Creates an empty canvas for missing textures
+    function fallbackCanvas(color) {
+        const c = document.createElement("canvas");
+        c.width = c.height = 4;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, 4, 4);
+        return c;
+    }
+
+    // Babylon POM needs Height packed into Normal Map Alpha
+    async function createPOMTexture(scene, normalUrls, heightUrls) {
+        let normImg = await loadImgData(normalUrls);
+        let heightImg = await loadImgData(heightUrls);
+        
+        if (!normImg) normImg = fallbackCanvas("#8080ff");
+        if (!heightImg) heightImg = fallbackCanvas("#808080");
+
+        const w = normImg.width, h = normImg.height;
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        
+        ctx.drawImage(normImg, 0, 0, w, h);
+        const normData = ctx.getImageData(0, 0, w, h);
+
+        const hCanvas = document.createElement("canvas");
+        hCanvas.width = w; hCanvas.height = h;
+        const hCtx = hCanvas.getContext("2d", { willReadFrequently: true });
+        hCtx.drawImage(heightImg, 0, 0, w, h);
+        const hData = hCtx.getImageData(0, 0, w, h);
+
+        // Inject height (Red channel) into Normal Alpha
+        for (let i = 0; i < normData.data.length; i += 4) {
+            normData.data[i + 3] = hData.data[i]; 
+        }
+        ctx.putImageData(normData, 0, 0);
+
+        return new BABYLON.DynamicTexture("pomBump", canvas, scene, true);
+    }
+
+    // Derived texture generator for single-color PNGs (Farmland/Podzol)
+    async function derivePBRTextures(scene, colorUrls, fallbackColor) {
+        let img = await loadImgData(colorUrls);
+        if (!img) img = fallbackCanvas(fallbackColor);
+
+        const w = Math.min(img.width, config.derivedMapSize);
+        const h = Math.min(img.height, config.derivedMapSize);
+        
+        // Base Color
+        const baseTex = new BABYLON.Texture(img.src || null, scene, true);
+        if (!img.src) {
+            const tempTex = new BABYLON.DynamicTexture("temp", {width: 4, height: 4}, scene);
+            tempTex.getContext().drawImage(img, 0, 0);
+            tempTex.update();
+        }
+
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, w, h);
+        const src = ctx.getImageData(0, 0, w, h).data;
+        
+        const lum = new Float32Array(w * h);
+        let mn = 1, mx = 0;
+        for (let i = 0; i < w * h; i++) {
+            const l = (0.299 * src[i*4] + 0.587 * src[i*4+1] + 0.114 * src[i*4+2]) / 255;
+            lum[i] = l; if(l<mn) mn=l; if(l>mx) mx=l;
+        }
+        const range = Math.max(1e-4, mx - mn);
+
+        const bumpCanvas = document.createElement('canvas');
+        bumpCanvas.width = w; bumpCanvas.height = h;
+        const bData = bumpCanvas.getContext('2d').createImageData(w, h);
+        
+        const strength = 3.0;
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                let sum = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    const yy = (y + dy + h) % h;
+                    for (let dx = -1; dx <= 1; dx++) sum += lum[yy * w + ((x + dx + w) % w)];
+                }
+                const ht = Math.pow((sum / 9 - mn) / range, 0.9);
+                
+                const l = lum[y * w + ((x - 1 + w) % w)], r = lum[y * w + ((x + 1) % w)];
+                const u = lum[((y - 1 + h) % h) * w + x], d = lum[((y + 1) % h) * w + x];
+                let nx = -(r - l) * strength, ny = (u - d) * strength, nz = 1;
+                const len = Math.hypot(nx, ny, nz);
+                
+                const i = y * w + x;
+                bData.data[i*4]   = ((nx/len) * 0.5 + 0.5) * 255;   // R = Normal X
+                bData.data[i*4+1] = ((ny/len) * 0.5 + 0.5) * 255;   // G = Normal Y
+                bData.data[i*4+2] = ((nz/len) * 0.5 + 0.5) * 255;   // B = Normal Z
+                bData.data[i*4+3] = Math.max(0, Math.min(1, ht)) * 255; // A = Height
+            }
+        }
+        bumpCanvas.getContext('2d').putImageData(bData, 0, 0);
+        const pomTex = new BABYLON.DynamicTexture("derivedBump", bumpCanvas, scene, true);
+
+        return { base: baseTex, bump: pomTex };
+    }
+
+    /* ================= MATERIALS SETUP ================= */
+    async function makePBRMat(name, baseUrls, bumpUrls, heightUrls, aoUrls, roughness) {
+        const mat = new BABYLON.PBRMaterial(name, scene);
+        mat.metallic = 0.0;
+        mat.roughness = roughness;
+        
+        // Try load base color
+        const img = await loadImgData(baseUrls);
+        if(img && img.src) mat.albedoTexture = new BABYLON.Texture(img.src, scene);
+        else mat.albedoColor = new BABYLON.Color3(0.5, 0.5, 0.5);
+
+        // Load AO
+        if(aoUrls) {
+            const aoImg = await loadImgData(aoUrls);
+            if(aoImg && aoImg.src) mat.ambientTexture = new BABYLON.Texture(aoImg.src, scene);
+        }
+
+        // Enable Babylon POM
+        mat.bumpTexture = await createPOMTexture(scene, bumpUrls, heightUrls);
+        mat.useParallax = true;
+        mat.useParallaxOcclusion = true;
+        mat.parallaxScaleBias = parseFloat(document.getElementById('depth').value);
+        
+        globalMaterials.push(mat);
+        return mat;
+    }
+
+    async function makeDerivedMat(name, colorUrls, colorHex, roughness) {
+        const mat = new BABYLON.PBRMaterial(name, scene);
+        mat.metallic = 0.0;
+        mat.roughness = roughness;
+        
+        const maps = await derivePBRTextures(scene, colorUrls, colorHex);
+        mat.albedoTexture = maps.base;
+        mat.bumpTexture = maps.bump;
+        
+        mat.useParallax = true;
+        mat.useParallaxOcclusion = true;
+        mat.parallaxScaleBias = parseFloat(document.getElementById('depth').value);
+        
+        globalMaterials.push(mat);
+        return mat;
+    }
+
+    // Load everything
+    const mGrassSide = await makePBRMat("grassSide", ["1000200235_basecolor.png"], ["1000200235_normal.png"], ["1000200235_height.png", "1000200235_bump.png"], ["1000200235_ao.png"], 1.0);
+    const mGrassTop  = await makePBRMat("grassTop",  ["1000200237_basecolor.png"], ["1000200237_normal.png"], ["1000200237_height.png", "1000200237_bump.png"], ["1000200237_ao.png"], 1.0);
+    const mDirtBot   = await makePBRMat("dirtBot",   ["bottomgrass.png"], [], [], null, 0.95);
+    
+    const mFarmSide  = await makeDerivedMat("farmSide", ["farmlandside.png", "Farmlandside.png"], "#5a3a25", 0.95);
+    const mFarmTop   = await makeDerivedMat("farmTop",  ["farmlandtop.png", "Farmlandtop.png"], "#4a3020", 0.95);
+    
+    const mPodSide   = await makeDerivedMat("podSide",  ["podzolside.png", "Podzolside.png"], "#5a4528", 0.95);
+    const mPodTop    = await makeDerivedMat("podTop",   ["podzoltop.png", "Podzoltop.png"], "#5a4020", 0.95);
+
+    document.getElementById('loading').style.display = 'none';
+
+    // MultiMaterials for the 6 faces (Side, Top, Bottom)
+    function createMultiMat(name, side, top, bottom) {
+        const multi = new BABYLON.MultiMaterial(name, scene);
+        multi.subMaterials.push(side, top, bottom);
+        return multi;
+    }
+
+    const matSets = {
+        grass: createMultiMat("mg", mGrassSide, mGrassTop, mDirtBot),
+        farmland: createMultiMat("mf", mFarmSide, mFarmTop, mDirtBot),
+        podzol: createMultiMat("mp", mPodSide, mPodTop, mDirtBot)
+    };
+
+    /* ================= TERRAIN & THIN INSTANCES ================= */
+    const baseBox = BABYLON.MeshBuilder.CreateBox("baseBox", { size: config.blockSize }, scene);
+    
+    // Map Box faces to MultiMaterial SubMaterials. 
+    // Babylon Box faces: 0,1,2,3 (Sides) | 4 (Top) | 5 (Bottom)
+    baseBox.subMeshes = [];
+    new BABYLON.SubMesh(0, 0, 24, 0, 24, baseBox);  // Faces 0-3 (Sides) -> Index 0
+    new BABYLON.SubMesh(1, 0, 24, 24, 6, baseBox);  // Face 4 (Top)      -> Index 1
+    new BABYLON.SubMesh(2, 0, 24, 30, 6, baseBox);  // Face 5 (Bottom)   -> Index 2
+    
+    // Create clones to hold specific block types
+    const meshes = {};
+    for(const type in matSets) {
+        meshes[type] = baseBox.clone("mesh_" + type);
+        meshes[type].material = matSets[type];
+        shadowGen.addShadowCaster(meshes[type]);
+        meshes[type].receiveShadows = true;
+    }
+    baseBox.dispose(); // Delete original template
+
+    const R = config.terrainRadius;
+    const B = config.blockSize;
+    const heightAt = (x, z) => Math.max(0, Math.floor(Math.sin(x * 0.25) * 1.2 + Math.cos(z * 0.25) * 1.2 + 1.0));
+
+    const zones = [
+        { type: 'farmland', cx: 4,  cz: 3, r: 2.6 },
+        { type: 'podzol',   cx: -1, cz: 6, r: 2.3 }
+    ];
+
+    function columnInfo(x, z) {
+        for (const zn of zones) {
+            if (Math.hypot(x - zn.cx, z - zn.cz) <= zn.r) return { type: zn.type, topY: 1 };
+        }
+        return { type: 'grass', topY: heightAt(x, z) };
+    }
+
+    const matrices = { grass: [], farmland: [], podzol: [] };
+    const colors = { grass: [], farmland: [], podzol: [] };
+
+    for (let x = -R; x <= R; x++) {
+        for (let z = -R; z <= R; z++) {
+            if (Math.hypot(x, z) > R) continue;
+            const { type, topY } = columnInfo(x, z);
+            
+            // Hollow Terrain Optimization
+            let minNeighbor = topY;
+            for(let dx=-1; dx<=1; dx++) {
+                for(let dz=-1; dz<=1; dz++) {
+                    if (Math.hypot(x+dx, z+dz) <= R) minNeighbor = Math.min(minNeighbor, columnInfo(x+dx, z+dz).topY);
+                    else minNeighbor = 0; 
+                }
+            }
+            
+            for (let y = minNeighbor; y <= topY; y++) {
+                matrices[type].push(BABYLON.Matrix.Translation(x * B, y * B + B / 2, z * B));
+                const v = 0.92 + Math.random() * 0.16;
+                colors[type].push(v, v, v, 1);
+            }
+        }
+    }
+
+    // Apply Thin Instances
+    for (const type in meshes) {
+        if (matrices[type].length > 0) {
+            meshes[type].thinInstanceAdd(matrices[type]);
+            meshes[type].thinInstanceSetBuffer("color", new Float32Array(colors[type]), 4);
+        } else {
+            meshes[type].dispose();
+        }
+    }
+
+    return scene;
+};
+
+/* ================= UI CONTROLS ================= */
+document.getElementById('depth').addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    document.getElementById('dv').textContent = val;
+    globalMaterials.forEach(m => m.parallaxScaleBias = val);
+});
+
+document.getElementById('cavity').addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    document.getElementById('cv').textContent = val;
+    globalMaterials.forEach(m => m.ambientTextureStrength = val);
+});
+
+/* ================= RUN LOOP ================= */
+createScene().then(scene => {
+    let frames = 0, last = performance.now();
+    engine.runRenderLoop(() => {
+        scene.render();
+        frames++;
+        const now = performance.now();
+        if (now - last >= 1000) {
+            document.getElementById('fps').textContent = Math.round(frames * 1000 / (now - last));
+            frames = 0; last = now;
+        }
+    });
+});
+
+window.addEventListener("resize", () => {
+    engine.resize();
+});
+</script>
+</body>
+</html>
